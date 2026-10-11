@@ -6,7 +6,7 @@
   "regions": ["fra1"],
   "functions": {
     "api/index.mjs": {
-      "includeFiles": ["public/**", "vendor/**"],
+      "includeFiles": "{public,vendor}/**",
       "maxDuration": 120
     }
   },
