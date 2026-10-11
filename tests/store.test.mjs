@@ -19,7 +19,9 @@ function fakeBlob() {
       assert.equal(options.access,'private');assert.equal(options.useCache,false);
       assert.equal(options.token,'test-only-token');
       const current=values.get(key);
-      return current?{statusCode:200,stream:new Response(current.text).body,blob:{etag:current.etag,size:Buffer.byteLength(current.text)}}:null;
+      // Match the real provider: compressed representations have weak ETags.
+      const transformed=current&&current.text.length>1024&&options.headers?.['accept-encoding']!=='identity';
+      return current?{statusCode:200,stream:new Response(current.text).body,blob:{etag:(transformed?'W/':'')+current.etag,size:Buffer.byteLength(current.text)}}:null;
     },
     async put(key,text,options){
       assert.equal(options.access,'private');assert.equal(options.addRandomSuffix,false);
@@ -102,6 +104,28 @@ test('Blob CAS update retries merge simultaneous updates and never overwrites co
   sdk.values.set('work-planner/state.json',{text:'broken {',etag:'"bad"'});
   await assert.rejects(store.read('state',{}),StoreCorruptionError);
   assert.equal(sdk.values.get('work-planner/state.json').text,'broken {');
+});
+
+test('large cloud records remain writable after every read without weakening stale-write protection',async()=>{
+  const sdk=fakeBlob(),store=await createStore({mode:'cloud',blobToken:'test-only-token',blobSdk:sdk});
+  const original={revision:0,entries:Array.from({length:24},(_,i)=>({id:`row-${i}`,tasks:'شرح کار چندخطی\nDatenprüfung '.repeat(12)}))};
+  await store.write('state',original,null);
+  const stale=await store.read('state');
+  for(let i=1;i<=5;i++){
+    const current=await store.read('state');assert.ok(!current.etag.startsWith('W/'));
+    current.value.revision=i;current.value.entries[0].tasks+=`\nEdit ${i}`;
+    await store.write('state',current.value,current.etag);
+    assert.deepEqual((await store.read('state')).value,current.value);
+  }
+  await assert.rejects(store.write('state',original,stale.etag),ConflictError);
+  assert.equal((await store.read('state')).value.revision,5);
+});
+
+test('an unexpected weak cloud ETag is never stripped or reused as a write precondition',async()=>{
+  let cancelled=false;
+  const sdk={get:async()=>({statusCode:200,stream:new ReadableStream({cancel(){cancelled=true;}}),blob:{etag:'W/"compressed"',size:20}})};
+  const store=await createStore({mode:'cloud',blobToken:'test-only-token',blobSdk:sdk});
+  await assert.rejects(store.read('state',{}),/storage is unavailable/);assert.equal(cancelled,true);
 });
 
 test('provider errors cannot leak token-bearing URLs and do not return empty data',async()=>{
