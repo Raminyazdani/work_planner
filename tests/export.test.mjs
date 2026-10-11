@@ -42,7 +42,8 @@ test('exports one workplace only, with numeric cached totals and editable formul
   assert.equal(detail.getCell('F4').numFmt, '[h]:mm');
   assert.equal(daily.getCell('B7').formula, "SUMIF('Time entries'!$B$7:$B$8,A7,'Time entries'!$F$7:$F$8)");
   assert.equal(daily.getCell('C7').result, 210);
-  assert.equal(daily.getCell('D7').value, 'Analysis | Documentation');
+  assert.equal(daily.getCell('D7').value, '09:00–11:00\nAnalysis\n\n12:00–13:30\nDocumentation');
+  assert.equal(detail.getCell('G6').value, 'Description / activity');
   assert.equal(detail.views[0].ySplit, 6);
   assert.equal(detail.getCell('G7').alignment.wrapText, true);
   assert.deepEqual(rows, original, 'export must not mutate saved state');
@@ -81,11 +82,93 @@ test('flags cross-workplace overlap and keeps formula-looking notes as literal t
     assert.equal(cell.formula, undefined);
     assert.equal(cell.hyperlink, undefined);
     assert.equal(cell.value, text);
-    assert.equal(daily.getCell(index + 7, 4).value, text);
+    assert.equal(daily.getCell(index + 7, 4).value, `09:00–10:00\n${text}`);
+    assert.equal(daily.getCell(index + 7, 4).type, ExcelJS.ValueType.String);
   }
   assert.equal(detail.getCell('H7').value, 'OVERLAP');
   assert.equal(detail.getCell('H7').fill.fgColor.argb, 'FFFFE2E7');
   assert.equal(detail.getCell('H8').value, '');
+});
+
+test('preserves multiline Persian and German descriptions, per-entry association and readable formatting', async () => {
+  const description = 'تحلیل داده‌ها و آماده‌سازی گزارش\nAuswertung der Messdaten: Prüfung, Größe, Änderungen.\n=SUM(A1:A2)';
+  const {book, detail, daily} = await readExport([
+    entry('morning', 'jena', '2027-03-04', '09:00', '11:00', {tasks: description}),
+    entry('afternoon', 'jena', '2027-03-04', '13:00', '15:00', {tasks: description}),
+  ]);
+  assert.equal(book.worksheets.length, 2);
+  for (const number of [7, 8]) {
+    assert.equal(detail.getCell(number, 7).value, description);
+    assert.equal(detail.getCell(number, 7).alignment.wrapText, true);
+    assert.equal(detail.getCell(number, 7).alignment.vertical, 'top');
+    assert.ok(detail.getRow(number).height >= 58);
+    assert.ok(detail.getRow(number).height <= 409);
+  }
+  assert.equal(daily.getCell('D7').value, `09:00–11:00\n${description}\n\n13:00–15:00\n${description}`);
+  assert.equal(daily.getCell('D7').alignment.wrapText, true);
+  assert.ok(daily.getRow(7).height > detail.getRow(7).height);
+  assert.equal(detail.getCell('I7').value, 'morning');
+  assert.equal(detail.getCell('I8').value, 'afternoon');
+});
+
+test('retains blank legacy descriptions and copies the full description to both overnight parts', async () => {
+  const legacy = entry('legacy', 'jena', '2027-03-01', '09:00', '10:00');
+  delete legacy.tasks;
+  const description = 'Nächtliche Auswertung\nکنترل داده‌ها';
+  const {detail, daily, totalMinutes} = await readExport([
+    legacy,
+    entry('empty', 'jena', '2027-03-02', '10:00', '11:00', {tasks: ''}),
+    entry('night', 'jena', '2027-03-03', '23:30', '00:45', {endNextDay: true, tasks: description}),
+  ]);
+  assert.equal(totalMinutes, 195);
+  assert.equal(detail.getCell('G7').value, '');
+  assert.equal(detail.getCell('G8').value, '');
+  assert.equal(daily.getCell('D7').value, '');
+  assert.equal(detail.getCell('G9').value, description);
+  assert.equal(detail.getCell('G10').value, description);
+  assert.equal(detail.getCell('I9').value, 'night');
+  assert.equal(detail.getCell('I10').value, 'night');
+  assert.equal(daily.getCell('D9').value, `23:30–24:00\n${description}`);
+  assert.equal(daily.getCell('D10').value, `00:00–00:45\n${description}`);
+});
+
+test('long descriptions remain exact and have readable continuation rows within Excel height limits', async () => {
+  const descriptions = [
+    'Änderung بررسی داده 🌱 '.repeat(95).slice(0, 1995),
+    Array.from({length: 80}, (_, index) => `${index + 1}: داده / Prüfung`).join('\r\n'),
+  ];
+  const {book, detail, totalMinutes} = await readExport(descriptions.map((tasks, index) => entry(`long-${index}`, 'jena', `2027-03-0${index + 1}`, '09:00', '11:00', {tasks})));
+  const continued = book.getWorksheet('Description details');
+  assert.ok(continued);
+  assert.equal(totalMinutes, 240);
+  assert.equal(detail.getCell('F4').formula, 'SUM(F7:F8)');
+  close(detail.getCell('F4').result, 240 / 1440);
+  for (const [index, description] of descriptions.entries()) {
+    const expected = description.replace(/\r\n?/g, '\n'); // Excel cell line-ending convention.
+    assert.equal(detail.getCell(index + 7, 7).value, expected);
+    assert.match(detail.getCell(index + 7, 7).note, /Description details/);
+    const parts = [];
+    for (let number = 7; number <= continued.rowCount; number++) {
+      if (continued.getCell(number, 5).value === `long-${index}`) {
+        parts.push(continued.getCell(number, 4).value);
+        assert.equal(continued.getCell(number, 4).alignment.wrapText, true);
+        assert.ok(continued.getRow(number).height <= 394);
+      }
+    }
+    assert.ok(parts.length >= 2);
+    assert.equal(parts.join(''), expected);
+  }
+});
+
+test('large daily summaries provide a clear full-text reference without losing per-entry descriptions', async () => {
+  const description = 'Auswertung und Kontrolle. '.repeat(75);
+  const rows = Array.from({length: 20}, (_, index) => entry(`daily-${index}`, 'jena', '2027-03-01', `${String(index).padStart(2, '0')}:00`, `${String(index).padStart(2, '0')}:30`, {tasks: description}));
+  const {book, daily, detail, totalMinutes} = await readExport(rows);
+  assert.equal(totalMinutes, 600);
+  assert.ok(book.getWorksheet('Description details'));
+  assert.ok(daily.getCell('D7').value.length < 32767);
+  assert.match(daily.getCell('D7').value, /full descriptions in Description details and Time entries/);
+  for (let number = 7; number <= detail.rowCount; number++) assert.equal(detail.getCell(number, 7).value, description);
 });
 
 test('rejects invalid export requests without producing files', async () => {

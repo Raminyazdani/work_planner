@@ -30,3 +30,22 @@ td input,td select{font-size:14px}td input[type=date]{font-size:12px}th{font-siz
 .session-dialog p{font-size:14px;line-height:1.9;color:#65758b}
 .session-dialog>.quiet{margin-top:20px;width:100%}
 @media(max-width:600px){.login-card{padding:26px 23px}.storage-mode{font-size:10px}.top-actions{flex-wrap:wrap;justify-content:flex-end}}
+
+/* Keep each activity description visibly attached to its own time entry. */
+.entry-row td{border-bottom:0}
+.description-row td{padding:0 12px 13px;border-bottom:2px solid #e4eaf3}
+.description-row{background:#fff;--description-accent:#2667dc}
+.description-row.seewiesen{--description-accent:#b66119}
+.description-row.selected{background:#edf3ff}
+.description-row.offday{background:#fff0f1}
+.description-row.offday.selected{background:#fbe3e6}
+.description-row.offday td{border-bottom-color:#f0c3c9}
+.description-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:3px 0 6px;direction:rtl}
+.description-heading label{font-size:12px;font-weight:600;color:#405570;cursor:text}
+.description-heading label span{font-size:11px;font-weight:400;color:#6a7b91}
+.description-count{font-size:10px;color:#6b7b91;white-space:nowrap;font-variant-numeric:tabular-nums}
+.description-row textarea{display:block;width:100%;min-height:66px;max-height:180px;resize:vertical;padding:9px 10px;font-size:13px;line-height:1.65;background:#fcfdff;border:1px solid #dce4ef;border-inline-start:3px solid var(--description-accent);border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere}
+.description-row textarea::placeholder{color:#8490a2}
+.description-row textarea:focus{background:#fff;border-color:#8aa8d1}
+.description-row.offday textarea{background:#fff8f8}
+.entry-help{margin:0;padding:9px 15px;border-bottom:1px solid #e7ecf3;color:#62748b;font-size:12px;line-height:1.8;direction:rtl}
