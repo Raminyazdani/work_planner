@@ -1,0 +1,11 @@
+import http from 'node:http';
+import {createApp,runtimeConfig} from './lib/app.mjs';
+const config=runtimeConfig();
+const port=Number(process.env.PORT||8765);
+if(!Number.isInteger(port)||port<0||port>65535)throw Error('Invalid PORT');
+const app=await createApp({config});
+const server=http.createServer(app);
+server.requestTimeout=30000;server.headersTimeout=10000;
+server.on('error',e=>{console.error(e.code==='EADDRINUSE'?'Port is already in use. Set PORT to another number.':'Server could not start.');process.exitCode=1;});
+server.listen(port,'127.0.0.1',()=>console.log(`Work Planner: http://127.0.0.1:${server.address().port}`));
+for(const signal of ['SIGINT','SIGTERM'])process.on(signal,()=>server.close(async()=>{await app.close();process.exit(0);}));
