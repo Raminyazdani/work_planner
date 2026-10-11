@@ -2,11 +2,23 @@ import {dayFlags} from './holidays.mjs';
 import {analyzeCalendar} from './calendar-core.mjs';
 import {mountCalendar} from './calendar-ui.mjs';
 import {sessionInfo,login} from './session.mjs';
+import {PlannerSync} from './sync.mjs';
+import {mergeEntries} from './merge.mjs';
 import {JOBS,DAY,dayNumber,dayString,parseTime,timeString,durationText,interval,monthBounds,daysInMonth,splitEntry,visibleEntries,analyze,normalizeState} from './core.mjs';
 const $=id=>document.getElementById(id),job=id=>JOBS.find(j=>j.id===id),esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const today=()=>{const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
-let state={version:1,entries:[]},revision=0,selected=null,history=[],saving=false,dirty=false,saveTimer,toastTimer,conflictsOpen=false;
+let state={version:1,entries:[]},selected=null,history=[],saving=false,dirty=false,saveTimer,toastTimer,conflictsOpen=false;
 let session={authenticated:false,mode:'local',authRequired:false},loaded=false,saveBlocked=false;
+let retryTimer,retryDelay=1000;
+const sync=new PlannerSync({request:apiFetch,getEntries:()=>state.entries,setEntries:entries=>{
+  state.entries=entries;dirty=sync.dirty;
+  if(selected&&!entries.some(row=>row.id===selected))selected=null;
+  render();
+},onStatus:syncStatus,onRebase:(base,remote)=>{
+  const rebased=history.map(snapshot=>mergeEntries(base,JSON.parse(snapshot),remote));
+  history=rebased.some(result=>result.conflicts.length)?[]:rebased.map(result=>JSON.stringify(result.entries));
+  $('undo-btn').disabled=!history.length;
+}});
 function preference(key,fallback){try{return localStorage.getItem(key)??fallback;}catch{return fallback;}}
 function storePreference(key,value){try{localStorage.setItem(key,value);}catch{}}
 let month=preference('work-planner-month',today().slice(0,7));try{monthBounds(month);}catch{month=today().slice(0,7);}$('month').value=month;
@@ -18,12 +30,12 @@ function showSession(){
   $('logout-btn').hidden=!session.authRequired;
 }
 async function apiFetch(url,options={}){
-  const response=await fetch(url,{...options,cache:'no-store',credentials:'same-origin'});
+  const response=await fetch(url,{...(url==='/api/state'?{signal:AbortSignal.timeout(30000)}:{}),...options,cache:'no-store',credentials:'same-origin'});
   if(response.status===401){
     session.authenticated=false;
     if(dirty||saving){$('session-message').textContent='نشست ورود پایان یافته. تغییرات ذخیره‌نشده در همین صفحه محفوظ است؛ دوباره وارد شو.';if(!$('session-dialog').open)$('session-dialog').showModal();}
     else window.location.replace('/login');
-    throw Error('برای ادامه دوباره وارد شو.');
+    throw Object.assign(Error('برای ادامه دوباره وارد شو.'),{authRequired:true});
   }
   return response;
 }
@@ -35,17 +47,32 @@ function conflictTitle(id){return [analysis.byId.has(id)?'تداخل با باز
 
 function toast(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,3800);}
 function checkpoint(){history.push(JSON.stringify(state.entries));if(history.length>40)history.shift();$('undo-btn').disabled=false;}
-function changed(keepEditor=false){dirty=true;$('save-status').textContent=saveBlocked?'تغییرات این صفحه ذخیره نشده':'ذخیره نشده…';clearTimeout(saveTimer);if(!saveBlocked)saveTimer=setTimeout(save,350);render(keepEditor);}
-async function save(){
- if(saving||!dirty||!loaded||saveBlocked)return;
- saving=true;dirty=false;const snapshot=JSON.stringify({...state,revision});
- try{
-  const r=await apiFetch('/api/state',{method:'PUT',headers:{'Content-Type':'application/json'},body:snapshot});
-  if(r.status===409){saveBlocked=true;$('conflict-actions').hidden=false;throw Error('اطلاعات در دستگاه یا زبانهٔ دیگری تغییر کرده است. برای جلوگیری از بازنویسی، ذخیره متوقف شد. ابتدا نسخهٔ این صفحه را پشتیبان بگیر و سپس آخرین اطلاعات را بارگذاری کن.');}
-  const value=await r.json();if(!r.ok)throw Error(value.error||'ذخیره انجام نشد.');revision=value.revision;$('save-status').textContent=dirty?'در حال ذخیره…':savedMessage();$('save-status').className='';
- }catch(e){dirty=true;$('save-status').textContent=saveBlocked?'تداخل نسخه‌ها — ذخیره متوقف شد':'ذخیره نشد — دوباره تلاش کن';$('save-status').className='error';$('notice').textContent=e.message;$('notice').hidden=false;}
- finally{saving=false;if(dirty&&$('save-status').className!=='error')save();}
+function changed(keepEditor=false){dirty=true;$('save-status').textContent=saveBlocked?'انتخاب نسخهٔ بازه لازم است':'ذخیره نشده…';clearTimeout(saveTimer);if(!saveBlocked)saveTimer=setTimeout(save,350);else renderSyncConflicts();render(keepEditor);}
+function syncStatus(value){
+  saving=value.state==='working';dirty=sync.dirty;saveBlocked=!!sync.conflicts.length;
+  $('conflict-actions').hidden=!saveBlocked;
+  if(saving){$('save-status').textContent=dirty?'در حال ذخیره…':'در حال هماهنگ‌سازی…';return;}
+  if(value.state==='saved'||value.state==='resolved'){
+    clearTimeout(retryTimer);retryDelay=1000;$('save-status').className='';
+    $('save-status').textContent=dirty?'ذخیره نشده…':savedMessage();if(loaded)render(true);return;
+  }
+  $('save-status').className='error';$('notice').hidden=false;
+  if(value.state==='conflict'){
+    clearTimeout(retryTimer);$('save-status').textContent='انتخاب نسخهٔ بازه لازم است';
+    $('notice').textContent='همین بازه در دو صفحه متفاوت تغییر کرده است. نسخهٔ کامل هر بازه را از پایین انتخاب کن؛ باقی تغییراتت حفظ شده‌اند.';
+    renderSyncConflicts();
+  }else{
+    $('save-status').textContent=value.state==='retry'?'اتصال موقتاً قطع شد — تلاش دوباره':'ذخیره نشد — دوباره تلاش کن';
+    $('notice').textContent=value.message;
+    if(value.state==='retry'){clearTimeout(retryTimer);retryTimer=setTimeout(()=>sync.refresh(),retryDelay);retryDelay=Math.min(30000,retryDelay*2);}
+  }
 }
+function renderSyncConflicts(){
+  const preview=row=>row?`<p dir="ltr">${esc(job(row.jobId).name)} · ${esc(row.date||'—')} · ${esc(row.start||'—')}–${esc(row.end||'—')}${row.endNextDay?' (+1 day)':''}</p><pre dir="auto">${esc(row.tasks||'بدون شرح فعالیت')}</pre>`:'<p>این بازه حذف شده است.</p>';
+  $('sync-conflict-list').innerHTML=sync.conflicts.map(conflict=>`<article class="sync-conflict"><div><h3>نسخهٔ این صفحه</h3>${preview(state.entries.find(row=>row.id===conflict.id))}<button class="quiet" data-sync-id="${esc(conflict.id)}" data-choice="local">حفظ نسخهٔ کامل این صفحه</button></div><div><h3>نسخهٔ سرور</h3>${preview(conflict.remote)}<button class="quiet" data-sync-id="${esc(conflict.id)}" data-choice="remote">استفاده از نسخهٔ کامل سرور</button></div></article>`).join('');
+}
+async function save(){if(!loaded||saveBlocked||!session.authenticated)return;clearTimeout(retryTimer);return sync.save();}
+function refreshWork(){if(loaded&&session.authenticated&&!saveBlocked&&!document.hidden&&!gesture){clearTimeout(retryTimer);return sync.refresh();}}
 $('save-status').onclick=()=>save();
 function changeMonth(value){try{monthBounds(value);}catch{return;}month=value;$('month').value=value;storePreference('work-planner-month',value);selected=null;render();calendarUI.load();}
 function add(jobId=$('draw-job').value,date=month===today().slice(0,7)?today():month+'-01',start='',end='',endNextDay=false){checkpoint();const row={id:crypto.randomUUID(),jobId,date,start,end,endNextDay,tasks:''};state.entries.push(row);selected=row.id;changed();return row;}
@@ -145,9 +172,9 @@ function pointerTime(event,track){const rect=track.getBoundingClientRect();retur
 function fromAbsolute(start,end){const day=Math.floor(start/DAY);return {date:dayString(day),start:timeString(start),end:timeString(end),endNextDay:Math.floor(end/DAY)>day};}
 function clearGhost(){document.querySelectorAll('.draw-preview').forEach(e=>e.remove());}
 function paintGhost(start,end){clearGhost();for(const track of document.querySelectorAll('.day-track')){const day=dayNumber(track.dataset.date)*DAY,s=Math.max(start,day),e=Math.min(end,day+DAY);if(s>=e)continue;const ghost=document.createElement('div');ghost.className='draw-preview';ghost.style.left=(s-day)/DAY*100+'%';ghost.style.width=(e-s)/DAY*100+'%';ghost.textContent=durationText(end-start);track.append(ghost);}}
-$('timeline').addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.calendar-block'))return;const track=e.target.closest('.day-track');if(!track)return;const block=e.target.closest('.block'),row=block&&state.entries.find(r=>r.id===block.dataset.id),v=row&&interval(row);const abs=pointerTime(e,track);gesture={id:e.pointerId,row,mode:row?(e.target.dataset.edge||'move'):'draw',anchor:abs,start:v?.start,end:v?.end,offset:v?abs-v.start:0,moved:false,x:e.clientX,y:e.clientY,lastTrack:track};$('timeline').setPointerCapture(e.pointerId);e.preventDefault();});
+$('timeline').addEventListener('pointerdown',e=>{if(e.button!==0||e.target.closest('.calendar-block'))return;const track=e.target.closest('.day-track');if(!track)return;const block=e.target.closest('.block'),row=block&&state.entries.find(r=>r.id===block.dataset.id),v=row&&interval(row);const abs=pointerTime(e,track);gesture={id:e.pointerId,row,originalTime:row&&[row.date,row.start,row.end,row.endNextDay],mode:row?(e.target.dataset.edge||'move'):'draw',anchor:abs,start:v?.start,end:v?.end,offset:v?abs-v.start:0,moved:false,x:e.clientX,y:e.clientY,lastTrack:track};$('timeline').setPointerCapture(e.pointerId);e.preventDefault();});
 $('timeline').addEventListener('pointermove',e=>{if(!gesture||e.pointerId!==gesture.id)return;const under=document.elementFromPoint(e.clientX,e.clientY),track=under?.closest('.day-track')||gesture.lastTrack;if(!track)return;gesture.lastTrack=track;if(Math.abs(e.clientX-gesture.x)+Math.abs(e.clientY-gesture.y)<4&&!gesture.moved)return;gesture.moved=true;const abs=pointerTime(e,track);let start=gesture.start,end=gesture.end;if(gesture.mode==='draw'){start=Math.min(gesture.anchor,abs);end=Math.max(gesture.anchor,abs);if(end-start>DAY)end=start+DAY;}else if(gesture.mode==='move'){start=abs-gesture.offset;end=start+(gesture.end-gesture.start);}else if(gesture.mode==='start')start=Math.max(gesture.end-DAY,Math.min(abs,gesture.end-15));else end=Math.min(gesture.start+DAY,Math.max(abs,gesture.start+15));gesture.result={start,end};paintGhost(start,end);});
-$('timeline').addEventListener('pointerup',e=>{if(!gesture||e.pointerId!==gesture.id)return;const g=gesture;gesture=null;clearGhost();if($('timeline').hasPointerCapture(e.pointerId))$('timeline').releasePointerCapture(e.pointerId);if(!g.moved){if(g.row)select(g.row.id);if(timelinePending)renderTimeline();return;}suppressClick=true;const r=g.result;if(!r||r.end-r.start<15){if(timelinePending)renderTimeline();return;}const fields=fromAbsolute(r.start,r.end);if(g.row){checkpoint();Object.assign(g.row,fields);selected=g.row.id;changed();}else add($('draw-job').value,fields.date,fields.start,fields.end,fields.endNextDay);});
+$('timeline').addEventListener('pointerup',e=>{if(!gesture||e.pointerId!==gesture.id)return;const g=gesture;gesture=null;clearGhost();if($('timeline').hasPointerCapture(e.pointerId))$('timeline').releasePointerCapture(e.pointerId);if(!g.moved){if(g.row)select(g.row.id);if(timelinePending)renderTimeline();return;}suppressClick=true;const r=g.result;if(!r||r.end-r.start<15){if(timelinePending)renderTimeline();return;}const fields=fromAbsolute(r.start,r.end);if(g.row){const live=state.entries.find(row=>row.id===g.row.id);if(!live){toast('این بازه در صفحهٔ دیگری حذف شده است.');renderTimeline();return;}if(g.originalTime.some((value,index)=>value!==[live.date,live.start,live.end,live.endNextDay][index])){toast('زمان این بازه در صفحهٔ دیگری تغییر کرد؛ آن را دوباره جابه‌جا کن.');renderTimeline();return;}checkpoint();Object.assign(live,fields);selected=live.id;changed();}else add($('draw-job').value,fields.date,fields.start,fields.end,fields.endNextDay);});
 $('timeline').addEventListener('pointercancel',()=>{gesture=null;clearGhost();if(timelinePending)renderTimeline();});
 $('session-form').onsubmit=async event=>{
  event.preventDefault();const button=$('session-submit');button.disabled=true;
@@ -157,6 +184,7 @@ $('session-form').onsubmit=async event=>{
 };
 $('session-dialog').addEventListener('cancel',event=>event.preventDefault());
 $('session-backup').onclick=()=>download(JSON.stringify(state,null,2),'work-planner-unsaved-backup.json','application/json');
+$('sync-conflict-list').onclick=event=>{const button=event.target.closest('[data-sync-id]');if(!button)return;sync.resolve(button.dataset.syncId,button.dataset.choice);if(!sync.conflicts.length)save();};
 $('conflict-reload').onclick=()=>{download(JSON.stringify(state,null,2),'work-planner-conflict-backup.json','application/json');dirty=false;window.location.reload();};
 $('logout-btn').onclick=async()=>{
  if(saving){toast('صبر کن تا ذخیره تمام شود.');return;}
@@ -168,8 +196,12 @@ try{
  if(!session.authenticated){window.location.replace('/login');}
  else{
   const response=await apiFetch('/api/state');if(!response.ok)throw Error('بارگذاری اطلاعات ممکن نشد. برای تلاش دوباره صفحه را تازه کن.');
-  const data=await response.json();state=normalizeState(data);if(!Number.isSafeInteger(data.revision)||data.revision<0)throw Error('نسخهٔ اطلاعات معتبر نیست.');revision=data.revision;loaded=true;
+  const data=await response.json();state=normalizeState(data);sync.initialize(data);loaded=true;
   $('save-status').textContent=session.mode==='cloud'?'اطلاعات از فضای خصوصی آنلاین خوانده شد':'اطلاعات از این کامپیوتر خوانده شد';
   $('planner-main').inert=false;$('backup-btn').disabled=false;$('import-btn').disabled=false;render();calendarUI.load();
  }
 }catch(error){$('notice').textContent=error.message;$('notice').hidden=false;$('save-status').textContent='بارگذاری انجام نشد — صفحه را تازه کن';$('save-status').className='error';}
+window.addEventListener('online',refreshWork);
+window.addEventListener('focus',refreshWork);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshWork();});
+setInterval(refreshWork,30000);
