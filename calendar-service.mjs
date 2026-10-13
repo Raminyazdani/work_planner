@@ -206,7 +206,7 @@ export async function createCalendarService(store, options={}) {
         const f=latest.settings.feeds.find(x=>x.id===outcome.feed.id&&x.configVersion===outcome.feed.configVersion);
         if(!f)continue;
         const old=cache.months?.[month]?.[f.id];
-        const validOld=old?.configVersion===f.configVersion?old:{};
+        const validOld=old&&old.configVersion===f.configVersion?old:{};
         // A later completed sync must not be replaced by an earlier attempt.
         if(Date.parse(validOld.lastAttempt||'1970-01-01')>Date.parse(outcome.lastAttempt))continue;
         cache.months ||= {};cache.months[month] ||= {};changed=true;

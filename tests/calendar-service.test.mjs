@@ -212,3 +212,69 @@ test('a cloud sync rechecks configuration and does not write results for a concu
   assert.equal(result.status.feeds.length,0);assert.equal(result.events.length,0);
   assert.equal(count.writes,0);assert.equal(count.updates,0);
 });
+
+async function legacyCalendar(t,{snapshotEvents=[]}={}) {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'planner-calendar-legacy-'));
+  t.after(()=>{assert.equal(path.dirname(path.resolve(root)),path.resolve(os.tmpdir()));return fs.rm(root,{recursive:true,force:true});});
+  const backing=await createStore({dataDir:root});
+  // Existing imports predate configVersion and contain only a September cache.
+  const september={events:parseCalendar(simple,feed,'2026-09'),fetchedAt:'2026-10-08T10:00:00Z',lastAttempt:'2026-10-08T10:00:00Z',error:null};
+  await backing.write('calendar-settings',{version:1,feeds:[{...feed,url}]},null);
+  await backing.write('calendar-cache',{version:1,months:{'2026-09':{[feed.id]:september}}},null);
+  await backing.write('calendar-snapshot',{months:['2026-09','2026-10'],fetchedAt:'2026-10-08T10:00:00Z',events:snapshotEvents},null);
+  return {backing,september,store:{mode:'cloud',read:backing.read,update:backing.update}};
+}
+
+test('a legacy feed without configVersion refreshes its first uncached month with an empty snapshot',async t=>{
+  const {store,backing,september}=await legacyCalendar(t);
+  let requests=0;
+  const service=await createCalendarService(store,{now:()=>Date.parse('2026-10-14T10:00:00Z'),fetch:async()=>{
+    requests++;return new Response(simple.replaceAll('20260903','20261003'));
+  }});t.after(()=>service.close());
+  const result=await service.getMonth('2026-10');
+  assert.equal(requests,1);assert.equal(result.events.length,1);assert.equal(result.events[0].title,'Meeting');
+  assert.equal(result.events[0].start,'2026-10-03T08:00:00.000Z');
+  assert.equal(result.status.feeds[0].error,null);assert.equal(result.coverage.feeds.length,1);
+  assert.equal(result.status.feeds[0].lastSynced,'2026-10-14T10:00:00.000Z');
+  assert.deepEqual((await backing.read('calendar-cache')).value.months['2026-09'][feed.id],september);
+  assert.equal((await backing.read('calendar-settings')).value.feeds[0].configVersion,undefined);
+  await service.getMonth('2026-10');assert.equal(requests,1);
+});
+
+test('a legacy feed failure in an uncached month keeps the stale snapshot and throttles the next attempt',async t=>{
+  const snapshotEvent={id:'old-october',calendarId:feed.calendarId,title:'Previous snapshot',start:'2026-10-03T08:00:00Z',end:'2026-10-03T09:00:00Z',allDay:false,busy:true};
+  const {store,backing,september}=await legacyCalendar(t,{snapshotEvents:[snapshotEvent]});
+  let requests=0;
+  const service=await createCalendarService(store,{now:()=>Date.parse('2026-10-14T10:00:00Z'),fetch:async()=>{
+    requests++;throw new Error('private feed '+url);
+  }});t.after(()=>service.close());
+  const result=await service.getMonth('2026-10');
+  assert.equal(requests,1);assert.equal(result.events.length,1);assert.equal(result.events[0].title,'Previous snapshot');
+  assert.ok(result.status.feeds[0].error);assert.equal(result.status.feeds[0].lastSynced,null);
+  assert.equal(result.status.lastSynced,'2026-10-08T10:00:00Z');assert.equal(result.coverage.feeds.length,0);
+  assert.deepEqual(result.coverage.snapshotCalendars,[feed.calendarId]);
+  assert.ok(!JSON.stringify(result).includes('testsecret'));
+  const cache=(await backing.read('calendar-cache')).value;
+  assert.deepEqual(cache.months['2026-09'][feed.id],september);
+  assert.equal(cache.months['2026-10'][feed.id].lastAttempt,'2026-10-14T10:00:00.000Z');
+  assert.equal(cache.months['2026-10'][feed.id].fetchedAt,undefined);
+  await service.getMonth('2026-10');assert.equal(requests,1);
+});
+
+test('a legacy feed refresh cannot populate a new month after its configuration has been replaced',async t=>{
+  const {store,backing}=await legacyCalendar(t);
+  let finish,started;
+  const pending=new Promise(r=>finish=r),ready=new Promise(r=>started=r);
+  const service=await createCalendarService(store,{autoSync:false,fetch:async()=>{
+    started();await pending;return new Response(simple.replaceAll('20260903','20261003'));
+  }});
+  const editing=await createCalendarService(backing,{autoSync:false});
+  t.after(()=>Promise.all([service.close(),editing.close()]));
+  const operation=service.sync('2026-10');await ready;
+  await editing.configure({add:{url:url.replace('private-testsecret','private-replacement'),name:'Replacement'}});
+  finish();await operation;
+  const result=await service.getMonth('2026-10');
+  assert.equal(result.events.length,0);assert.equal(result.coverage.feeds.length,0);
+  assert.equal(result.status.feeds[0].name,'Replacement');
+  assert.equal((await backing.read('calendar-cache')).value.months['2026-10'],undefined);
+});
