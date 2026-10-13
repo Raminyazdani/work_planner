@@ -6,6 +6,17 @@ const copy=value=>structuredClone(value);
 const row=(id='entry-a',changes={})=>({id,jobId:'jena',date:'2030-06-12',start:'09:00',end:'12:00',endNextDay:false,tasks:'Original activity',...changes});
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
 
+test('storage unavailability preserves additions, deletions and descriptions until recovery',async()=>{
+  const f=fixture([row(),row('deleted-row')]);
+  f.editor=[row('entry-a',{tasks:'Latest description\nشرح فعالیت'}),row('new-row')];
+  f.hook(()=>Response.json({code:'STORAGE_UNAVAILABLE',error:'فضای ذخیره‌سازی در دسترس نیست.'},{status:503,headers:{'Retry-After':'900'}}));
+  const before=copy(f.editor);assert.equal(await f.sync.save(),false);
+  assert.deepEqual(f.editor,before);assert.equal(f.sync.dirty,true);
+  assert.equal(f.statuses.at(-1).code,'STORAGE_UNAVAILABLE');assert.equal(f.statuses.at(-1).retryAfterMs,900000);
+  assert.equal(f.statuses.at(-1).message,'فضای ذخیره‌سازی در دسترس نیست.');
+  f.hook(null);assert.equal(await f.sync.refresh(),true);assert.deepEqual(f.server.entries,before);assert.equal(f.sync.dirty,false);
+});
+
 // An in-memory revisioned server exercises the real controller without timers,
 // network services, credentials, or any of the user's records.
 function fixture(initial=[row()],revision=1){

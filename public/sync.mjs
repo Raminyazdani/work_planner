@@ -1,5 +1,6 @@
 import {normalizeState} from './core.mjs';
 import {mergeEntries} from './merge.mjs';
+import {responseError} from './session.mjs';
 
 const copy=value=>structuredClone(value);
 const equal=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
@@ -22,8 +23,8 @@ export class PlannerSync{
   get dirty(){return !equal(this.base,this.getEntries())||!!this.uncertain||!!this.conflicts.length;}
   async response(route,options){
     let response;
-    try{response=await this.request(route,options);}catch(error){if(error.authRequired)throw error;throw new RequestError('ارتباط برقرار نشد؛ تغییرات این صفحه محفوظ است و دوباره تلاش می‌کنیم.',true);}
-    if(!response.ok&&response.status!==409)throw new RequestError(response.status===401?'برای ادامه دوباره وارد شو.':'ذخیره انجام نشد؛ تغییرات این صفحه محفوظ است.',response.status>=500||response.status===429);
+    try{response=await this.request(route,options);}catch(error){if(error.authRequired||error.code==='STORAGE_UNAVAILABLE')throw error;throw new RequestError('ارتباط برقرار نشد؛ تغییرات این صفحه محفوظ است و دوباره تلاش می‌کنیم.',true);}
+    if(!response.ok&&response.status!==409)throw await responseError(response,response.status===401?'برای ادامه دوباره وارد شو.':'ذخیره انجام نشد؛ تغییرات این صفحه محفوظ است.');
     return response;
   }
   async pull(){
@@ -64,7 +65,7 @@ export class PlannerSync{
           // Read the editor again; a later edit or deletion must follow this ack.
         }
         throw new RequestError('تغییرات در حال هماهنگ‌شدن است؛ دوباره تلاش می‌کنیم.',true);
-      }catch(error){this.onStatus({state:error.retryable?'retry':'error',message:error.message});return false;}
+      }catch(error){this.onStatus({state:error.retryable?'retry':'error',message:error.message,code:error.code,retryAfterMs:error.retryAfterMs});return false;}
       finally{this.active=null;}
     });
     return this.active;

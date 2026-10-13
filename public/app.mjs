@@ -1,7 +1,8 @@
 import {dayFlags} from './holidays.mjs';
 import {analyzeCalendar} from './calendar-core.mjs';
 import {mountCalendar} from './calendar-ui.mjs';
-import {sessionInfo,login} from './session.mjs';
+import {sessionInfo,login,responseError} from './session.mjs';
+import {RefreshBudget,watchRefresh} from './polling.mjs';
 import {PlannerSync} from './sync.mjs';
 import {mergeEntries} from './merge.mjs';
 import {JOBS,DAY,dayNumber,dayString,parseTime,timeString,durationText,interval,monthBounds,daysInMonth,splitEntry,visibleEntries,analyze,normalizeState} from './core.mjs';
@@ -9,7 +10,8 @@ const $=id=>document.getElementById(id),job=id=>JOBS.find(j=>j.id===id),esc=s=>S
 const today=()=>{const d=new Date();return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
 let state={version:1,entries:[]},selected=null,history=[],saving=false,dirty=false,saveTimer,toastTimer,conflictsOpen=false;
 let session={authenticated:false,mode:'local',authRequired:false},loaded=false,saveBlocked=false;
-let retryTimer,retryDelay=1000;
+let retryTimer,retryDelay=1000,storageUnavailableUntil=0;
+const workBudget=new RefreshBudget({interval:()=>session.mode==='cloud'?300000:30000,cloud:()=>session.mode==='cloud',visible:()=>!document.hidden});
 const sync=new PlannerSync({request:apiFetch,getEntries:()=>state.entries,setEntries:entries=>{
   state.entries=entries;dirty=sync.dirty;
   if(selected&&!entries.some(row=>row.id===selected))selected=null;
@@ -23,7 +25,7 @@ function preference(key,fallback){try{return localStorage.getItem(key)??fallback
 function storePreference(key,value){try{localStorage.setItem(key,value);}catch{}}
 let month=preference('work-planner-month',today().slice(0,7));try{monthBounds(month);}catch{month=today().slice(0,7);}$('month').value=month;
 let analysis=analyze([],month),calendarData={events:[],status:{},coverage:{}},calendarReview=analyzeCalendar([],[],month);
-const calendarUI=mountCalendar({month:()=>month,request:apiFetch,isReady:()=>loaded&&session.authenticated,onData:data=>{calendarData=data;render(true);},onViewChange:()=>render()});
+const calendarUI=mountCalendar({month:()=>month,mode:()=>session.mode,request:apiFetch,isReady:()=>loaded&&session.authenticated,onData:data=>{calendarData=data;render(true);},onViewChange:()=>render()});
 function savedMessage(){return session.mode==='cloud'?'ذخیره شد در فضای خصوصی آنلاین':'ذخیره شد روی این کامپیوتر';}
 function showSession(){
   $('storage-mode').textContent=session.mode==='cloud'?'فضای خصوصی آنلاین':'ذخیرهٔ محلی';
@@ -37,6 +39,13 @@ async function apiFetch(url,options={}){
     else window.location.replace('/login');
     throw Object.assign(Error('برای ادامه دوباره وارد شو.'),{authRequired:true});
   }
+  if(response.status===503){
+    const error=await responseError(response.clone(),'سرویس موقتاً در دسترس نیست؛ تغییرات این صفحه محفوظ است.');
+    if(error.code==='STORAGE_UNAVAILABLE'){
+      storageUnavailableUntil=Math.max(storageUnavailableUntil,Date.now()+error.retryAfterMs);
+      workBudget.defer(error.retryAfterMs);throw error;
+    }
+  }
   return response;
 }
 function offday(date){try{return dayFlags(date,calendarUI.region(),{assumptionDay:['BY','BOTH'].includes(calendarUI.region())});}catch{return {red:false,weekend:false,names:[],holidays:[]};}}
@@ -47,7 +56,7 @@ function conflictTitle(id){return [analysis.byId.has(id)?'تداخل با باز
 
 function toast(text){$('toast').textContent=text;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('toast').hidden=true,3800);}
 function checkpoint(){history.push(JSON.stringify(state.entries));if(history.length>40)history.shift();$('undo-btn').disabled=false;}
-function changed(keepEditor=false){dirty=true;$('save-status').textContent=saveBlocked?'انتخاب نسخهٔ بازه لازم است':'ذخیره نشده…';clearTimeout(saveTimer);if(!saveBlocked)saveTimer=setTimeout(save,350);else renderSyncConflicts();render(keepEditor);}
+function changed(keepEditor=false){dirty=true;$('save-status').textContent=saveBlocked?'انتخاب نسخهٔ بازه لازم است':Date.now()<storageUnavailableUntil?'ذخیره نشده — فضای ذخیره‌سازی در دسترس نیست':'ذخیره نشده…';clearTimeout(saveTimer);if(!saveBlocked)saveTimer=setTimeout(save,350);else renderSyncConflicts();render(keepEditor);}
 function syncStatus(value){
   saving=value.state==='working';dirty=sync.dirty;saveBlocked=!!sync.conflicts.length;
   $('conflict-actions').hidden=!saveBlocked;
@@ -62,17 +71,27 @@ function syncStatus(value){
     $('notice').textContent='همین بازه در دو صفحه متفاوت تغییر کرده است. نسخهٔ کامل هر بازه را از پایین انتخاب کن؛ باقی تغییراتت حفظ شده‌اند.';
     renderSyncConflicts();
   }else{
-    $('save-status').textContent=value.state==='retry'?'اتصال موقتاً قطع شد — تلاش دوباره':'ذخیره نشد — دوباره تلاش کن';
+    $('save-status').textContent=value.code==='STORAGE_UNAVAILABLE'?'ذخیره نشد — فضای ذخیره‌سازی در دسترس نیست':value.state==='retry'?'اتصال موقتاً قطع شد — تلاش دوباره':'ذخیره نشد — دوباره تلاش کن';
     $('notice').textContent=value.message;
-    if(value.state==='retry'){clearTimeout(retryTimer);retryTimer=setTimeout(()=>sync.refresh(),retryDelay);retryDelay=Math.min(30000,retryDelay*2);}
+    if(value.state==='retry'){
+      const delay=Math.max(retryDelay,value.retryAfterMs||0);workBudget.defer(delay);
+      if(value.code==='STORAGE_UNAVAILABLE')storageUnavailableUntil=Math.max(storageUnavailableUntil,Date.now()+delay);
+      clearTimeout(retryTimer);retryTimer=setTimeout(()=>refreshWork('retry'),delay);retryDelay=Math.min(30000,retryDelay*2);
+    }
   }
 }
 function renderSyncConflicts(){
   const preview=row=>row?`<p dir="ltr">${esc(job(row.jobId).name)} · ${esc(row.date||'—')} · ${esc(row.start||'—')}–${esc(row.end||'—')}${row.endNextDay?' (+1 day)':''}</p><pre dir="auto">${esc(row.tasks||'بدون شرح فعالیت')}</pre>`:'<p>این بازه حذف شده است.</p>';
   $('sync-conflict-list').innerHTML=sync.conflicts.map(conflict=>`<article class="sync-conflict"><div><h3>نسخهٔ این صفحه</h3>${preview(state.entries.find(row=>row.id===conflict.id))}<button class="quiet" data-sync-id="${esc(conflict.id)}" data-choice="local">حفظ نسخهٔ کامل این صفحه</button></div><div><h3>نسخهٔ سرور</h3>${preview(conflict.remote)}<button class="quiet" data-sync-id="${esc(conflict.id)}" data-choice="remote">استفاده از نسخهٔ کامل سرور</button></div></article>`).join('');
 }
-async function save(){if(!loaded||saveBlocked||!session.authenticated)return;clearTimeout(retryTimer);return sync.save();}
-function refreshWork(){if(loaded&&session.authenticated&&!saveBlocked&&!document.hidden&&!gesture){clearTimeout(retryTimer);return sync.refresh();}}
+async function save(){
+  if(!loaded||saveBlocked||!session.authenticated)return;
+  if(Date.now()<storageUnavailableUntil){clearTimeout(retryTimer);retryTimer=setTimeout(()=>refreshWork('retry'),storageUnavailableUntil-Date.now());return false;}
+  clearTimeout(retryTimer);workBudget.attempted();return sync.save();
+}
+function refreshWork(reason='poll'){
+  if(loaded&&session.authenticated&&!saveBlocked&&!gesture)return workBudget.run(()=>{clearTimeout(retryTimer);return sync.refresh();},{reason});
+}
 $('save-status').onclick=()=>save();
 function changeMonth(value){try{monthBounds(value);}catch{return;}month=value;$('month').value=value;storePreference('work-planner-month',value);selected=null;render();calendarUI.load();}
 function add(jobId=$('draw-job').value,date=month===today().slice(0,7)?today():month+'-01',start='',end='',endNextDay=false){checkpoint();const row={id:crypto.randomUUID(),jobId,date,start,end,endNextDay,tasks:''};state.entries.push(row);selected=row.id;changed();return row;}
@@ -195,13 +214,10 @@ try{
  session=await sessionInfo();showSession();
  if(!session.authenticated){window.location.replace('/login');}
  else{
-  const response=await apiFetch('/api/state');if(!response.ok)throw Error('بارگذاری اطلاعات ممکن نشد. برای تلاش دوباره صفحه را تازه کن.');
+  workBudget.attempted();const response=await apiFetch('/api/state');if(!response.ok)throw await responseError(response,'بارگذاری اطلاعات ممکن نشد. برای تلاش دوباره صفحه را تازه کن.');
   const data=await response.json();state=normalizeState(data);sync.initialize(data);loaded=true;
   $('save-status').textContent=session.mode==='cloud'?'اطلاعات از فضای خصوصی آنلاین خوانده شد':'اطلاعات از این کامپیوتر خوانده شد';
   $('planner-main').inert=false;$('backup-btn').disabled=false;$('import-btn').disabled=false;render();calendarUI.load();
  }
 }catch(error){$('notice').textContent=error.message;$('notice').hidden=false;$('save-status').textContent='بارگذاری انجام نشد — صفحه را تازه کن';$('save-status').className='error';}
-window.addEventListener('online',refreshWork);
-window.addEventListener('focus',refreshWork);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshWork();});
-setInterval(refreshWork,30000);
+watchRefresh(workBudget,refreshWork);

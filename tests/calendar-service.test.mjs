@@ -144,3 +144,71 @@ test('sync never resurrects a removed feed, and corruption is not treated as an 
   await assert.rejects(service.getMonth('2026-09'),/unreadable/);
   assert.equal(await fs.readFile(path.join(root,'calendar-settings.json'),'utf8'),'broken {');
 });
+
+async function meteredCloud(t,{snapshot=true}={}) {
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'planner-calendar-cloud-'));
+  t.after(()=>fs.rm(root,{recursive:true,force:true}));
+  const backing=await createStore({dataDir:root});
+  await backing.write('calendar-settings',{version:1,feeds:[{...feed,url,configVersion:'v1'}]},null);
+  await backing.write('calendar-cache',{version:1,months:{}},null);
+  if(snapshot)await backing.write('calendar-snapshot',{months:[],events:[]},null);
+  const count={reads:0,updates:0,writes:0};
+  const store={mode:'cloud',
+    async read(...args){count.reads++;return backing.read(...args);},
+    async update(key,fallback,mutate){
+      // Count the transaction's read as well as explicit service reads.
+      count.reads++;count.updates++;
+      return backing.update(key,fallback,async value=>{
+        const next=await mutate(value);if(next!==undefined)count.writes++;return next;
+      });
+    }};
+  return {store,backing,count};
+}
+
+test('cloud calendar refresh is 15 minutes; warm GETs share reads and explicit refresh bypasses the interval',async t=>{
+  const {store,count}=await meteredCloud(t);
+  let clock=Date.parse('2026-10-08T10:00:00Z'),requests=0;
+  const service=await createCalendarService(store,{now:()=>clock,fetch:async()=>{requests++;return new Response(simple);}});
+  t.after(()=>service.close());
+  assert.equal(count.reads,3);
+  const initial=await Promise.all(Array.from({length:8},()=>service.getMonth('2026-09')));
+  assert.equal(requests,1);assert.equal(count.reads,7);assert.equal(count.writes,1);
+  for(const result of initial){assert.equal(result.status.pollSeconds,900);assert.equal(result.events[0].title,'Meeting');}
+  await service.getMonth('2026-09');assert.equal(count.reads,7);
+  clock+=60000;
+  await Promise.all(Array.from({length:8},()=>service.getMonth('2026-09')));
+  assert.equal(count.reads,10);assert.equal(requests,1);assert.equal(count.writes,1);
+  clock+=14*60000;
+  const before=count.reads;
+  await service.getMonth('2026-09');assert.equal(requests,2);assert.equal(count.reads-before,7);
+  // A user-triggered refresh always contacts Google even just after an auto refresh.
+  await service.sync('2026-09');assert.equal(requests,3);assert.equal(count.writes,3);
+  assert.equal((await service.getMonth('2026-09')).events[0].title,'Meeting');
+});
+
+test('cloud calendar does not negatively cache absent documents or replace a failed read with empty data',async t=>{
+  const {store,backing}=await meteredCloud(t,{snapshot:false});
+  let clock=Date.parse('2026-10-08T10:00:00Z'),unavailable=false;
+  const read=store.read;store.read=(...args)=>unavailable?Promise.reject(new Error('private storage unavailable')):read(...args);
+  const service=await createCalendarService(store,{now:()=>clock,autoSync:false});t.after(()=>service.close());
+  await backing.write('calendar-snapshot',{months:['2026-09'],events:[{id:'imported',calendarId:'secondary@example.com',title:'Imported',start:'2026-09-03T08:00:00Z',end:'2026-09-03T09:00:00Z'}]},null);
+  assert.equal((await service.getMonth('2026-09')).events[0].title,'Imported');
+  unavailable=true;clock+=60000;
+  await assert.rejects(service.getMonth('2026-09'),/private storage unavailable/);
+  unavailable=false;
+  assert.equal((await service.getMonth('2026-09')).events[0].title,'Imported');
+});
+
+test('a cloud sync rechecks configuration and does not write results for a concurrently removed feed',async t=>{
+  const {store,backing,count}=await meteredCloud(t);
+  let finish,started;
+  const pending=new Promise(r=>finish=r),ready=new Promise(r=>started=r);
+  const service=await createCalendarService(store,{autoSync:false,fetch:async()=>{started();await pending;return new Response(simple);}});
+  t.after(()=>service.close());
+  const operation=service.sync('2026-09');await ready;
+  await backing.update('calendar-settings',{version:1,feeds:[]},settings=>({...settings,feeds:[]}));
+  finish();await operation;
+  const result=await service.getMonth('2026-09');
+  assert.equal(result.status.feeds.length,0);assert.equal(result.events.length,0);
+  assert.equal(count.writes,0);assert.equal(count.updates,0);
+});

@@ -2,6 +2,7 @@ import {randomUUID, createHash} from 'node:crypto';
 import ICAL from './vendor/ical-2.2.1.mjs';
 
 const DAY = 86400000, MAX_BYTES = 12 * 1024 * 1024, POLL_MS = 60000;
+const CLOUD_POLL_MS = 15 * 60000, CLOUD_READ_CACHE_MS = 60000;
 const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 const cut = (value, n = 500) => String(value ?? '').slice(0, n);
 function validMonth(month) { if (!MONTH.test(month)) throw new Error('ماه تقویم معتبر نیست.'); return month; }
@@ -116,10 +117,13 @@ const SYNC_ERROR = 'همگام‌سازی انجام نشد؛ آخرین نسخ�
 export async function createCalendarService(store, options={}) {
   if (!store?.read || !store?.update) throw new TypeError('A private persistence store is required');
   const fetcher=options.fetch || globalThis.fetch, now=options.now || Date.now;
+  const cloud=['cloud','blob'].includes(store.mode);
+  const pollMs=cloud?CLOUD_POLL_MS:POLL_MS, readCacheMs=cloud?CLOUD_READ_CACHE_MS:0;
   let view={settings:SETTINGS,cache:CACHE,snapshot:SNAPSHOT}, activeMonth=null, closed=false;
+  let loadedAt=-Infinity,loadPromise=null,loadVersion=0,viewCacheable=false;
   const requestedSync=new Map();
 
-  async function load() {
+  async function readView(version) {
     const [a,b,c]=await Promise.all([
       store.read('calendar-settings',SETTINGS), store.read('calendar-cache',CACHE), store.read('calendar-snapshot',SNAPSHOT)
     ]);
@@ -134,7 +138,21 @@ export async function createCalendarService(store, options={}) {
       ids.add(f.id);
     }
     snapshot.events=snapshot.events.map(normalizeEvent).filter(Boolean);
-    return view={settings,cache,snapshot};
+    const data={settings,cache,snapshot};
+    // Missing documents are not negatively cached: another instance may have
+    // just added a feed or imported a snapshot. Failed reads never replace view.
+    if(version===loadVersion) {
+      view=data;viewCacheable=[a,b,c].every(result=>result.etag!==null);
+      loadedAt=viewCacheable?now():-Infinity;
+    }
+    return data;
+  }
+  async function load(force=false) {
+    if(!force&&readCacheMs&&now()-loadedAt>=0&&now()-loadedAt<readCacheMs)return view;
+    if(!force&&loadPromise)return loadPromise;
+    const operation=readView(++loadVersion);loadPromise=operation;
+    try{return await operation;}
+    finally{if(loadPromise===operation)loadPromise=null;}
   }
   function entry(data,month,feed) {
     const value=data.cache.months[month]?.[feed.id];
@@ -146,7 +164,7 @@ export async function createCalendarService(store, options={}) {
     const lastSynced=settings.feeds.map(f=>entry(data,month,f)?.fetchedAt).filter(Boolean).sort().at(-1)||
       (snapshot.months.includes(month)?snapshot.fetchedAt:null)||null;
     const coveredMonths=[...new Set([...snapshot.months,...Object.keys(cache.months).filter(m=>settings.feeds.some(f=>entry(data,m,f)?.fetchedAt))])].sort();
-    return {mode:source,source,autoSync:!!settings.feeds.length,pollSeconds:POLL_MS/1000,
+    return {mode:source,source,autoSync:!!settings.feeds.length,pollSeconds:pollMs/1000,
       snapshotAt:snapshot.fetchedAt||null,fetchedAt:lastSynced,lastSynced,coveredMonths,snapshotCoversMonth:snapshot.months.includes(month),
       feeds:settings.feeds.map(f=>({id:f.id,name:f.name,calendarId:f.calendarId,lastSynced:entry(data,month,f)?.fetchedAt||null,
         lastAttempt:entry(data,month,f)?.lastAttempt||null,error:entry(data,month,f)?.error||null}))};
@@ -162,8 +180,8 @@ export async function createCalendarService(store, options={}) {
   }
   async function doSync(month,force) {
     if (closed) throw new Error('Calendar service is closed');
-    const initial=await load();
-    const feeds=initial.settings.feeds.filter(f=>force||now()-Date.parse(entry(initial,month,f)?.lastAttempt||'1970-01-01')>=POLL_MS);
+    const initial=await load(force);
+    const feeds=initial.settings.feeds.filter(f=>force||now()-Date.parse(entry(initial,month,f)?.lastAttempt||'1970-01-01')>=pollMs);
     if(!feeds.length)return status(month,initial);
     const outcomes=[];
     let index=0;
@@ -177,23 +195,33 @@ export async function createCalendarService(store, options={}) {
     }));
     // Sync never writes settings. CAS merges cache entries without reviving removed feeds or
     // applying an old URL's events to an updated configuration, even on another instance.
-    const latest=await load();
-    await store.update('calendar-cache',CACHE,cache=>{
-      cache.months ||= {};
-      cache.months[month] ||= {};
-      for(const outcome of outcomes) {
+    // Always re-read configuration after the download. A warm instance must
+    // not apply data from a feed removed/replaced by a different instance.
+    const latest=await load(true);
+    const applicable=outcomes.filter(outcome=>latest.settings.feeds.some(f=>f.id===outcome.feed.id&&f.configVersion===outcome.feed.configVersion));
+    if(!applicable.length)return status(month,latest);
+    const committed=await store.update('calendar-cache',CACHE,cache=>{
+      let changed=false;
+      for(const outcome of applicable) {
         const f=latest.settings.feeds.find(x=>x.id===outcome.feed.id&&x.configVersion===outcome.feed.configVersion);
         if(!f)continue;
-        const old=cache.months[month][f.id];
+        const old=cache.months?.[month]?.[f.id];
         const validOld=old?.configVersion===f.configVersion?old:{};
         // A later completed sync must not be replaced by an earlier attempt.
         if(Date.parse(validOld.lastAttempt||'1970-01-01')>Date.parse(outcome.lastAttempt))continue;
+        cache.months ||= {};cache.months[month] ||= {};changed=true;
         cache.months[month][f.id]={...validOld,configVersion:f.configVersion,lastAttempt:outcome.lastAttempt,error:outcome.error,
           ...(outcome.events?{events:outcome.events,fetchedAt:outcome.fetchedAt}:{})};
       }
-      return cache;
+      // Keep the checked timestamp even when events are unchanged, so cold
+      // instances also observe the refresh interval. Obsolete attempts do not write.
+      return changed?cache:undefined;
     });
-    return status(month,await load());
+    const data={...latest,cache:committed.value};
+    // Reuse the CAS result instead of reading all three documents once more.
+    // A concurrent local configure/load takes precedence over this view.
+    if(view===latest){view=data;loadedAt=viewCacheable?now():-Infinity;}
+    return status(month,data);
   }
   function sync(month=activeMonth,{force=true}={}) {
     validMonth(month);activeMonth=month;
@@ -204,7 +232,7 @@ export async function createCalendarService(store, options={}) {
   async function getMonth(month) {
     validMonth(month);activeMonth=month;
     let data=await load();
-    if(options.autoSync!==false&&data.settings.feeds.some(f=>now()-Date.parse(entry(data,month,f)?.lastAttempt||'1970-01-01')>=POLL_MS)) {
+    if(options.autoSync!==false&&data.settings.feeds.some(f=>now()-Date.parse(entry(data,month,f)?.lastAttempt||'1970-01-01')>=pollMs)) {
       await sync(month,{force:false});data=await load();
     }
     const {settings,snapshot}=data,covered=new Set();let events=[];
@@ -239,7 +267,7 @@ export async function createCalendarService(store, options={}) {
       return settings;
     });
     if(!parsed)await store.update('calendar-cache',CACHE,cache=>{for(const stored of Object.values(cache.months))delete stored[change.remove];return cache;});
-    return status(activeMonth,await load());
+    return status(activeMonth,await load(true));
   }
   await load();
   return {getMonth,status,configure,sync,async close(){closed=true;await Promise.allSettled([...requestedSync.values()]);}};

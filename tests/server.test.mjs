@@ -5,14 +5,14 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {createApp,runtimeConfig} from '../lib/app.mjs';
-import {createStore} from '../lib/store.mjs';
+import {createStore,StorageError,StoreCorruptionError} from '../lib/store.mjs';
 import {digest} from '../lib/auth.mjs';
 
 const KEY='synthetic-test-only-key-01234567890123456789';
 const entry={id:'entry-one',jobId:'jena',date:'2030-06-12',start:'09:00',end:'11:30',endNextDay:false,tasks:'synthetic-private-task'};
-async function setup(t,{cloud=false}={}){
+async function setup(t,{cloud=false,wrapStore=store=>store}={}){
   const dataDir=await fs.mkdtemp(path.join(os.tmpdir(),'planner-http-test-'));
-  const store=await createStore({mode:'local',dataDir});
+  const store=wrapStore(await createStore({mode:'local',dataDir}));
   const config={mode:cloud?'cloud':'local',cloud,accessKeyHash:cloud?digest(KEY):'',dataDir};
   const app=await createApp({config,store,calendarOptions:{autoSync:false,fetch:()=>{throw Error('Network forbidden in synthetic tests');}}});
   const server=http.createServer(app);await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
@@ -96,4 +96,93 @@ test('static serving never exposes data, source, env, or path traversal',async t
   const {call}=await setup(t);
   for(const route of ['/.env','/.data/state.json','/lib/auth.mjs','/../package.json','/%2e%2e/package.json','/public/../package.json','/calendar-service.mjs'])assert.equal((await call(route)).status,404,route);
   assert.equal((await call('/index.html',{method:'HEAD'})).bytes.length,0);
+});
+
+test('blocked cloud storage leaves login assets and health available while private routes fail closed',async t=>{
+  let reads=0,updates=0,writes=0;
+  const upstreamSecret='upstream-token-and-calendar-secret';
+  const fail=()=>{throw new StorageError(upstreamSecret);};
+  const {call}=await setup(t,{cloud:true,wrapStore:store=>({...store,
+    read:async()=>{reads++;fail();},update:async()=>{updates++;fail();},write:async()=>{writes++;fail();},
+  })});
+  assert.equal(reads,0,'starting the app must not access Blob');
+  const headers={Cookie:'__Host-work_planner='+'x'.repeat(43)};
+  for(const route of ['/api/health','/login','/login.mjs','/session.mjs','/style.css','/favicon.svg']){
+    const response=await call(route,{headers});assert.equal(response.status,200,route);
+    assert.equal(response.headers['cache-control'],'no-store');
+  }
+  assert.equal(reads,0,'public assets must not attempt session or calendar reads');
+  assert.equal((await call('/api/state')).status,401);
+  for(const route of ['/api/session','/api/state','/']){
+    const response=await call(route,{headers});assert.equal(response.status,503,route);
+    assert.equal(response.json().code,'STORAGE_UNAVAILABLE');assert.equal(response.headers['retry-after'],'300');
+    assert.ok(!response.text.includes(upstreamSecret));assert.ok(!response.text.includes('entries'));
+  }
+  const login=await call('/api/login',{method:'POST',body:{accessKey:KEY}});
+  assert.equal(login.status,503);assert.equal(login.json().code,'STORAGE_UNAVAILABLE');
+  assert.equal(login.headers['set-cookie'],undefined);assert.equal(updates,1);assert.equal(writes,0);
+  for(const route of ['/','/index.html']){
+    const page=await call(route,{headers:{...headers,Accept:'text/html,application/xhtml+xml'}});
+    assert.equal(page.status,503);assert.match(page.headers['content-type'],/text\/html/);assert.equal(page.headers['retry-after'],'300');
+    assert.match(page.text,/id="login-form"/);assert.ok(!page.text.includes('/app.mjs'));assert.ok(!page.text.includes(upstreamSecret));
+    assert.equal(page.headers['set-cookie'],undefined,'outage must not revoke an existing session');
+  }
+  const privateAsset=await call('/app.mjs',{headers:{...headers,Accept:'text/html'}});
+  assert.equal(privateAsset.status,503);assert.equal(privateAsset.json().code,'STORAGE_UNAVAILABLE');
+  const api=await call('/api/state',{headers:{...headers,Accept:'text/html'}});
+  assert.equal(api.status,503);assert.equal(api.json().code,'STORAGE_UNAVAILABLE');
+});
+
+test('storage outage never replaces existing entries and saving recovers without restarting the app',async t=>{
+  let unavailable=false,original,writes=0;
+  const {call,signIn,store}=await setup(t,{cloud:true,wrapStore:underlying=>{
+    original=underlying;
+    return {...underlying,
+      read:async(key,fallback)=>{if(unavailable&&key==='state')throw new StorageError('private upstream failure');return underlying.read(key,fallback);},
+      write:async(...args)=>{writes++;return underlying.write(...args);},
+    };
+  }});
+  await store.write('state',{version:1,revision:7,entries:[entry]},null);
+  const headers={Cookie:await signIn()};unavailable=true;
+  for(const [route,options] of [['/api/state',{headers}],['/api/state',{method:'PUT',headers,body:{revision:7,entries:[]}}]]){
+    const response=await call(route,options);assert.equal(response.status,503);assert.equal(response.json().code,'STORAGE_UNAVAILABLE');
+  }
+  assert.equal(writes,1,'an unavailable read must never trigger a replacement write');
+  assert.deepEqual((await original.read('state')).value,{version:1,revision:7,entries:[entry]});
+  unavailable=false;
+  assert.deepEqual((await call('/api/state',{headers})).json().entries,[entry]);
+  const changed={...entry,tasks:'Updated after storage recovery'};
+  assert.deepEqual((await call('/api/state',{method:'PUT',headers,body:{revision:7,entries:[changed]}})).json(),{revision:8});
+  assert.deepEqual((await call('/api/state',{headers})).json().entries,[changed]);
+});
+
+test('calendar initialization is lazy and can retry after failure without blocking work records',async t=>{
+  let unavailable=true,calendarReads=0;
+  const {call,store}=await setup(t,{wrapStore:underlying=>({...underlying,
+    read:async(key,fallback)=>{
+      if(key.startsWith('calendar-')){calendarReads++;if(unavailable)throw new StorageError('private feed unavailable');}
+      return underlying.read(key,fallback);
+    },
+  })});
+  assert.equal(calendarReads,0);
+  await store.write('state',{version:1,revision:2,entries:[entry]},null);
+  assert.equal((await call('/')).status,200);
+  assert.deepEqual((await call('/api/state')).json().entries,[entry]);
+  const failure=await call('/api/calendar?month=2030-06');
+  assert.equal(failure.status,503);assert.equal(failure.json().code,'STORAGE_UNAVAILABLE');
+  unavailable=false;
+  const recovered=await call('/api/calendar?month=2030-06');
+  assert.equal(recovered.status,200);assert.deepEqual(recovered.json().events,[]);
+  assert.deepEqual((await call('/api/state')).json().entries,[entry]);
+});
+
+test('unreadable persisted records return an explicit service error instead of an empty state',async t=>{
+  let writes=0;
+  const {call}=await setup(t,{wrapStore:underlying=>({...underlying,
+    read:async()=>{throw new StoreCorruptionError();},write:async()=>{writes++;},
+  })});
+  const response=await call('/api/state');
+  assert.equal(response.status,503);assert.equal(response.json().code,'STORAGE_UNREADABLE');
+  assert.ok(!response.text.includes('entries'));assert.equal(writes,0);
+  assert.equal((await call('/login')).status,200);
 });
