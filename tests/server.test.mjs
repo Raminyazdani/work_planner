@@ -38,6 +38,18 @@ test('runtime config refuses unsafe cloud/local fallback and separates preview d
   assert.equal(runtimeConfig({...env,VERCEL_ENV:'preview'}).prefix,'work-planner-preview');
 });
 
+test('postgres cloud storage requires a database and access key without falling back to Blob',()=>{
+  const env={VERCEL:'1',WORK_PLANNER_STORAGE:'postgres',DATABASE_URL:'postgresql://synthetic:password@db.example/planner',WORK_PLANNER_ACCESS_KEY_HASH:digest(KEY)};
+  const config=runtimeConfig(env);
+  assert.equal(config.storage,'postgres');assert.equal(config.mode,'cloud');
+  assert.equal(config.databaseUrl,env.DATABASE_URL);assert.equal(config.blobToken,undefined);
+  assert.equal(runtimeConfig({...env,WORK_PLANNER_DATABASE_URL:'explicit-test-url'}).databaseUrl,'explicit-test-url');
+  assert.throws(()=>runtimeConfig({...env,DATABASE_URL:'',BLOB_READ_WRITE_TOKEN:'unused'}),/must be configured/);
+  assert.throws(()=>runtimeConfig({...env,WORK_PLANNER_ACCESS_KEY_HASH:''}),/must be configured/);
+  assert.throws(()=>runtimeConfig({...env,WORK_PLANNER_STORAGE:'unknown'}),/Invalid storage/);
+  assert.equal(runtimeConfig({WORK_PLANNER_MODE:'local',WORK_PLANNER_STORAGE:'postgres'}).storage,'local');
+});
+
 test('anonymous cloud users get only login assets and public status; private routes are denied',async t=>{
   const {call,store}=await setup(t,{cloud:true});
   await store.write('state',{version:1,revision:0,entries:[entry]},null);

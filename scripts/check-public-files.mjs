@@ -7,6 +7,8 @@ const forbidden=/(^|\/)(?:\.data|data|\.secrets|\.vercel|node_modules|runtime|ex
 const patterns=[
   ['private key',/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/],
   ['provider credential',/\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|vercel_blob_rw_[A-Za-z0-9_]{20,})/],
+  ['Neon database credential',/\bnpg_[A-Za-z0-9]{12,}/],
+  ['Neon connection string',/postgres(?:ql)?:\/\/[^\s"'<>]+:[^\s"'<>]+@[^\s"'<>]+\.neon\.tech\b/i],
   ['private calendar feed',/calendar\.google\.com\/calendar\/ical\/[^\s"'<>]+\/private-[A-Za-z0-9_-]{24,}\/basic\.ics/],
   ['machine-specific path',/[A-Z]:[\\/]+Users[\\/]+[A-Za-z0-9_.-]+[\\/]/i],
   ['unredacted access hash',/WORK_PLANNER_ACCESS_KEY_HASH\s*=\s*[a-f0-9]{64}\b/i],

@@ -4,16 +4,20 @@
   "private": true,
   "type": "module",
   "description": "Private personal work planner with a visual timeline, calendar overlap checks and Excel export.",
-  "engines": { "node": ">=22.9.0" },
+  "engines": {
+    "node": ">=22.9.0"
+  },
   "scripts": {
     "start": "node --env-file-if-exists=.env server.mjs",
     "dev": "node --env-file-if-exists=.env --watch server.mjs",
     "build": "node scripts/build.mjs",
     "test": "node --test tests/*.test.mjs",
     "security:scan": "node scripts/check-public-files.mjs",
-    "setup:key": "node scripts/create-access-key.mjs"
+    "setup:key": "node scripts/create-access-key.mjs",
+    "setup:database": "node --env-file-if-exists=.env scripts/setup-database.mjs"
   },
   "dependencies": {
+    "@neondatabase/serverless": "1.2.0",
     "@vercel/blob": "2.8.1",
     "exceljs": "4.4.0"
   },
